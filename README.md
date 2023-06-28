@@ -94,7 +94,31 @@ cor_time <- toc()
 ```
 ## correlation: 9.264 sec elapsed
 ```
-* Example4: finding phylum
-  
 
+  
+* Example4: finding phylum
+  sequence used:
+  [sequence file]([sequence-2.txt](https://github.com/cmkim1/SSU_classifier/files/11893250/sequence-2.txt))
+  blast result: *Escherichia Coli* (Proteobacteria)  
+  * Result
+    
+  |rank|Phylum|lambda.min|
+  |-----|-----|-----|
+  |1|Proteobacteria|0.02066498|
+  |2|Chloroflexi|0.64248237|
+  |3|Bdellovibrionota|0.65915294|
+  |4|Fusobacteriota|0.69814215|
+  |5|Myxococcota|0.891009659|
+  
+  
+```
+tic("finding")
+...
+...
+...
+finding_time <- toc()
+```
+```
+## finding: 64.383 sec elapsed
+```
 
