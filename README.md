@@ -41,7 +41,7 @@
 * Boosting
   
 ## 4. Results
-* Example1: mono-, di-, trimer
+#### Example1: mono-, di-, trimer
   * Summary
     |Model|time (s)|auc|bin_dev|
     |-----|-----|-----|-----|
@@ -54,7 +54,7 @@
 
 
             
-* Example2: pentamer
+#### Example2: pentamer
   * Summary
     |Model|time (s)|auc|bin_dev|
     |-----|-----|-----|-----|
@@ -65,7 +65,7 @@
 
   * top5 significant sequences: 1. TGATA 2. ACCGA 3. GTTCT 4. TTACG 5. CTGGT
 
-* Example3: collapsed pentamer
+#### Example3: collapsed pentamer
   Correlation coefficient threshold was determined by Example2 LASSO data.
   Number of appropriate number of parameters were around 125.
   The target number was 150.
@@ -96,7 +96,7 @@ cor_time <- toc()
 ```
 
   
-* Example4: finding phylum
+#### Example4: finding phylum
   sequence used:
   [sequence file]([sequence-2.txt](https://github.com/cmkim1/SSU_classifier/files/11893250/sequence-2.txt))
   blast result: *Escherichia Coli* (Proteobacteria)  
