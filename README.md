@@ -41,19 +41,37 @@
 * Boosting
   
 ## 4. Results
-* Example1
+* Example1: mono-, di-, trimer
   * Summary
-    |method|time (s)|auc|bin_dev|
+    |Model|time (s)|auc|bin_dev|
     |-----|-----|-----|-----|
     |LOGISTIC|0.846|0.9894948|806.6|
     |LASSO|9.456|0.9899495|784.4|
     |RF|24.025|0.9941032|1144.1|
     |BOOSTING|27.32|0.9929736|680.5|
       
-  * top5 significant sequqences
-    1. TA 2. AT 3. GG 4. TG 5. TT
-* Example2
-  * Summary
+  * top5 significant sequqences: 1. TA 2. AT 3. GG 4. TG 5. TT
 
+
+            
+* Example2: pentamer
+  * Summary
+    |Model|time (s)|auc|bin_dev|
+    |-----|-----|-----|-----|
+    |LOGISTIC|219.47|0.9990533|238.8|
+    |LASSO|18.317|0.9997188|113.7|
+    |RF|373.869|0.9996336|576.5|
+    |BOOSTING|1079.283|0.9995689|139.3|
+
+  * top5 significant sequences: 1. TGATA 2. ACCGA 3. GTTCT 4. TTACG 5. CTGGT
+
+* Example3: collapsed pentamer
+  * Summary
+    |Model|time (s)|auc|bin_dev|
+    |-----|-----|-----|-----|
+    |LOGISTIC|219.47|0.9990533|238.8|
+    |LASSO|18.317|0.9997188|113.7|
+    |RF|373.869|0.9996336|576.5|
+    |BOOSTING|1079.283|0.9995689|139.3|
 
 
