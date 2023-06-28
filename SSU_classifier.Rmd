@@ -1,0 +1,958 @@
+---
+title: "SSU_classifier"
+output: html_document
+author: csbl_cmkim
+date: "2023-06-12"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+```
+
+##### 0-1. loading library
+분석에 필요한 라이브러리 로드.
+```{r library}
+
+#install.packages("https://cran.r-project.org/src/contrib/Archive/BiocManager/BiocManager_1.30.19.tar.gz", repos = NULL, type="source")
+#BiocManager::install("DNAStringSet")
+library(dplyr)
+library(ggplot2)
+library(ISLR)
+library(MASS)
+library(glmnet)
+library(randomForest)
+library(gbm)
+library(rpart)
+library(boot)
+library(data.table)
+library(ROCR)
+library(gridExtra)
+library(tidyr)
+library(stringr)
+library(Biostrings)
+library(psych)
+library(tictoc)
+```
+
+
+##### 0-2. defining function
+분석에 필요한 함수 정의.
+```{r function}
+
+#binomial_deviance function
+binomial_deviance <- function(y_obs, yhat){
+  epsilon = 0.0001
+  yhat = ifelse(yhat < epsilon, epsilon, yhat)
+  yhat = ifelse(yhat > 1-epsilon, 1-epsilon, yhat)
+  a = ifelse(y_obs==0, 0, y_obs * log(y_obs/yhat))
+  b = ifelse(y_obs==1, 0, (1-y_obs) * log((1-y_obs)/(1-yhat)))
+  return(2*sum(a + b))
+}
+
+#predict.cv.glmnet function
+predict.cv.glmnet=function(object,newx,s=c("lambda.1se","lambda.min"),...){
+  if(is.numeric(s))lambda=s
+  else
+    if(is.character(s)){
+      s=match.arg(s)
+      lambda=object[[s]]
+      names(lambda)=s
+    }
+  else stop("Invalid form for s")
+  predict(object$glmnet.fit,newx,s=lambda,...)
+}
+
+
+#panel.cor function
+panel.cor <- function(x, y, digits = 2, prefix = "", cex.cor, ...)
+{
+  usr <- par("usr"); on.exit(par(usr))
+  par(usr = c(0, 1, 0, 1))
+  r <- abs(cor(x, y))
+  txt <- format(c(r, 0.123456789), digits = digits)[1]
+  txt <- paste0(prefix, txt)
+  if(missing(cex.cor)) cex.cor <- 0.8/strwidth(txt)
+  text(0.5, 0.5, txt, cex = cex.cor * r)
+} 
+```
+
+##### 1. loading data
+데이터 로딩  
+학습에 사용한 데이터는 16S-ITGDB (integrated database) 로 원핵생물의 16S rRNA 서열 기반 분류에 필요한 데이터 모음으로 각 종의 분류와 16S 서열이 나열되어 있다.  
+https://github.com/yphsieh/16S-ITGDB/tree/master/data
+
+##### 1-1. loading taxa
+종 분류 정보
+```{r taxa}
+seq_itgdb_taxa <- read.csv("/Users/chungminkim/Downloads/drive-download-20230604T125759Z-001/seq_itgdb_taxa.txt",
+                           sep='\t', header=F)
+taxa <- separate(seq_itgdb_taxa, V2, into = c('kingdom', 'phylum', 'class', 'order', 'family', 'genus', 'species'), sep = ";")
+colnames(taxa)[c(1)] <- c('id')
+glimpse(taxa)
+```
+
+##### 1-2. loading sequences
+각 종의 16S 서열 정보
+```{r sequences}
+seq_itgdb_seq <- readDNAStringSet("/Users/chungminkim/Downloads/drive-download-20230604T125759Z-001/seq_itgdb_seq.fasta")
+id_sequence = data.frame(id=names(seq_itgdb_seq),sequences=as.character(seq_itgdb_seq))
+glimpse(id_sequence)
+
+# 486640 16S sequence in total
+
+```
+
+##### 1-3. processing data & counting frequency
+로딩한 두 데이터를 합치고 phylum 단위에서 분류한다.
+```{r processing}
+phylum_seq <- cbind(taxa[,3], id_sequence[,2])
+colnames(phylum_seq) <- c('phylum', 'sequence')
+phylum_seq <- as_tibble(phylum_seq)
+glimpse(phylum_seq)
+```
+
+phylum의 수 및 분포  
+proteobacteria, firmicutes, bacteroidota, actinobacteriota의 시퀀스가 압도적으로 많다.
+```{r}
+phylum_seq <- phylum_seq %>% filter(!is.na(phylum))
+phylum_seq %>% summarize(n_phylum = n_distinct(phylum)) # number of phylum: 317
+taxa %>% group_by(phylum) %>% count(sort=T) # frequency table
+
+phyla = taxa %>% group_by(phylum) %>% count(sort=T)
+ggplot(phyla[1:10,], aes(reorder(phylum, -n),n)) +
+  geom_bar(stat='identity') +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1))
+# proteobacteria, firmicutes, bacteroidota, actinobacteriota, ....
+
+
+phylum_table <- phylum_seq %>% group_by(phylum) %>%
+  summarize(Freq=n_distinct(sequence))
+phylum_table <- phylum_table %>% filter(row_number() <= n()-1) # remove NA
+
+
+# number of phyla which have more than 100, 1000, 10000 freq
+phylum_table %>%
+  summarize(more_than_100 = n_distinct(phylum_table %>% filter(Freq > 100)),
+            more_than_1000 = n_distinct(phylum_table %>% filter(Freq > 1000)),
+            more_than_10000 = n_distinct(phylum_table %>% filter(Freq > 10000))
+  ) #120, 38, 5
+```
+
+
+##### 2-1. example1: firmicutes
+가장 많은 서열 정보를 가지고 있는 firmicutes 속에 대하여 mono-, di-, trimer의 조성으로 다른 속과 구분 가능한지 확인한다.  
+
+먼저 데이터 중 임의로 20,000개의 서열을 고른다. 이 20,000개의 서열 내에 firmicutes 속의 서열은 몇개인지 확인한다.
+```{r example1_data}
+
+# randomly selecting 20,000 sequence
+data <- phylum_seq %>% sample_n(20000)
+
+#number of firmicutes sequence and others
+data %>%
+  summarize(n_firmicutes = n_distinct(data %>% filter(phylum == "firmicutes")),
+            n_others = n_distinct(data %>% filter(phylum != "firmicutes")))
+```
+여기서 뽑은 서열정보를 이용해서 학습을 진행할 것이다.  
+각 서열의 mono-, di-, trimer 조성 정보를 데이터에 추가한다.
+```{r}
+# counting nucleotide mono, di, trimer
+r16Sstr <- DNAStringSet(data$sequence)
+k1fq = alphabetFrequency(r16Sstr)
+k1fq = k1fq[,1:4]
+k2fq = dinucleotideFrequency(r16Sstr)
+k3fq = trinucleotideFrequency(r16Sstr)
+#k4fq = oligonucleotideFrequency(r16Sstr, width=4)
+#k5fq = oligonucleotideFrequency(r16Sstr, width=5)
+data <- cbind(data[,1], k1fq, k2fq, k3fq)
+colnames(data)[1]<-'phylum'
+head(data[1:10])
+```
+
+이항연산을 진행하기 위해 firmicutes를 기준으로 phylum을 0 혹은 1로 바꾼다. (firmicutes는 0, 아니면 1)
+```{r}
+data$phylum <- factor(ifelse(data$phylum == 'firmicutes', 0, 1))
+head(data[1:10])
+```
+
+
+
+##### 2-2. example1 running
+로지스틱 회귀, LASSO, 랜덤 포레스트, 부스팅 모델을 차례대로 적용한다.
+로지스틱 회귀 분석
+가장 유의미한 서열 조합 다섯개를 추출했다
+```{r running1}
+data2 <- data
+colnames(data2)[1]<-'phylum'
+
+
+
+#TRAINING
+set.seed(2306)
+n <- nrow(data2)
+idx <- 1:n
+training_idx <- sample(idx, n * .60)
+idx <- setdiff(idx, training_idx)
+validate_idx <- sample(idx, n * .20)
+test_idx <- setdiff(idx, validate_idx)
+training <- data2[training_idx,]
+validation <- data2[validate_idx,]
+test <- data2[test_idx,]
+
+
+#LOGISTIC REGRESSION
+tic("LOGISTIC")
+data2_lm_full <- glm(phylum ~ ., data=training, family=binomial)
+summary.glm(data2_lm_full)
+predict(data2_lm_full, newdata = data2[1:5,], type='response')
+LOGISTIC_time <- toc()
+
+contribution <- as.data.frame(data2_lm_full$coefficients)
+modified_contribution <- as.data.frame(cbind(nucleotide = rownames(contribution), score = contribution[, 1]))
+sorted_contribution <- modified_contribution[rev(order(modified_contribution[, 2])),]
+print(sorted_contribution[2:6, ])
+
+
+#MODEL EVALUATION
+y_obs <- as.numeric(as.character(validation$phylum))
+yhat_lm <- predict(data2_lm_full, newdata = validation, type='response')
+pred_lm <- prediction(as.numeric(yhat_lm), as.numeric(y_obs))
+#performance(pred_lm, "auc")@y.values[[1]]
+#binomial_deviance(y_obs, yhat_lm) 
+#plot(performance(pred_lm, measure="tpr", x.measure='fpr'))
+cbind(as.data.frame(data2[1:5, 1]),
+      as.data.frame(predict(data2_lm_full, newdata = data2[1:5,], type='response')))
+
+```
+
+LASSO 모델
+모수는 약 50개로 충분하다.
+```{r}
+
+
+#LASSO MODEL
+xx <- model.matrix(phylum ~ .-1, data2)
+x <- xx[training_idx, ]
+y <- as.numeric(as.character(training$phylum))
+#glimpse(x)
+
+
+tic("LASSO")
+data2_cvfit <- cv.glmnet(x, y, family = "binomial")
+
+plot(data2_cvfit)
+LASSO_time <- toc()
+
+#coef(data2_cvfit, s = c("lambda.1se"))
+length(which(coef(data2_cvfit, s ="lambda.min")>0)) #50
+```
+다섯개 서열에 대해서 예상
+```{r}
+#MODEL EVALUATION
+predict.cv.glmnet(data2_cvfit, s='lambda.min', newx = x[1:5,], type='response')
+predi <- as.data.frame(predict.cv.glmnet(data2_cvfit, s='lambda.min', newx = x[1:5,], type='response'))
+cbind(data2[as.numeric(rownames(x[1:5,])), 1], predi)
+
+yhat_glmnet <- predict(data2_cvfit, s="lambda.min", newx=xx[validate_idx,],
+                       type='response')
+yhat_glmnet <- yhat_glmnet[,1]
+pred_glmnet <- prediction(yhat_glmnet, y_obs)
+#performance(pred_glmnet, "auc")@y.values[[1]]
+#binomial_deviance(y_obs, yhat_glmnet)
+```
+
+나무 모델
+```{r}
+
+#TREE MODEL
+data2_tr <- rpart(phylum ~ ., data = training)
+#data2_tr
+
+#printcp(data2_tr)
+#summary(data2_tr)
+
+opar <- par(mfrow = c(1,1), xpd = NA)
+plot(data2_tr)
+text(data2_tr, use.n = T)
+par(opar)
+
+#EVALUATION
+yhat_tr <- predict(data2_tr, validation)
+yhat_tr <- yhat_tr[,"1"]
+pred_tr <- prediction(yhat_tr, y_obs)
+#performance(pred_tr, "auc")@y.values[[1]]
+#binomial_deviance(y_obs, yhat_tr)
+```
+
+랜덤 포레스트
+```{r}
+#RANDOM FOREST
+set.seed(2305)
+tic("RF")
+data2_rf <- randomForest(phylum ~., training)
+#data2_rf
+RF_time <- toc()
+#opar <- par(mfrow=c(1,2))
+#plot(data2_rf)
+#varImpPlot(data2_rf)
+#par(opar)
+
+#EVALUATION
+yhat_rf <- predict(data2_rf, newdata=validation, type='prob')[,'1']
+pred_rf <- prediction(yhat_rf, y_obs)
+#performance(pred_rf, "auc")@y.values[[1]]
+#binomial_deviance(y_obs, yhat_rf)
+```
+
+부스팅
+```{r}
+#BOOSTING
+set.seed(2305)
+tic("BOOSTING")
+data2_for_gbm <-
+  training %>%
+  mutate(phylum=as.numeric(as.character(phylum)))
+data2_gbm <- gbm(phylum ~ .,
+                           data = data2_for_gbm, distribution="bernoulli",
+                           n.trees=1806,
+                           n.minobsinnode = 1,
+                           cv.folds=3,
+                           verbose=T)
+(best_iter = gbm.perf(data2_gbm, method="cv")) #1806
+BOOSTING_time <- toc()
+
+#EVALUATION
+yhat_gbm <- predict(data2_gbm, n.trees=best_iter, newdata=validation, type='response')
+pred_gbm <- prediction(yhat_gbm, y_obs)
+#performance(pred_gbm, "auc")@y.values[[1]]
+#binomial_deviance(y_obs, yhat_gbm)
+```
+
+
+각 모델에 소요된 시간과 정확도를 확인한다.
+AUC, bin_dev, time 비교
+```{r}
+#최종 모형 선택과 테스트세트 오차 계산
+(ex1_final <- data.frame(method=c('lm', 'glmnet', 'rf', 'gbm'),
+           time = c(LOGISTIC_time$callback_msg,
+                    LASSO_time$callback_msg,
+                    RF_time$callback_msg,
+                    BOOSTING_time$callback_msg),
+           auc = c(performance(pred_lm, "auc")@y.values[[1]],
+                   performance(pred_glmnet, "auc")@y.values[[1]],
+                   performance(pred_rf, "auc")@y.values[[1]],
+                   performance(pred_gbm, "auc")@y.values[[1]]),
+           bin_dev = c(binomial_deviance(y_obs, yhat_lm),
+                       binomial_deviance(y_obs, yhat_glmnet),
+                       binomial_deviance(y_obs, yhat_rf),
+                       binomial_deviance(y_obs, yhat_gbm))))
+```
+모든 모델에서 높은 auc 값을 얻을 수 있다. 소요시간은 로지스틱 << LASSO < 랜덤포레스트 < 부스팅 순이다.
+
+
+
+
+ROC curve
+```{r}
+#ROC curve
+perf_lm <- performance(pred_lm, measure = "tpr", x.measure = "fpr")
+perf_glmnet <- performance(pred_glmnet, measure = "tpr", x.measure = "fpr")
+perf_rf <- performance(pred_rf, measure = "tpr", x.measure = "fpr")
+perf_gbm <- performance(pred_gbm, measure = "tpr", x.measure = "fpr")
+
+plot(perf_lm, col='black', main="ROC Curve")
+plot(perf_glmnet, add=T, col='blue')
+plot(perf_rf, add=T, col='red')
+plot(perf_gbm, add=T, col='cyan')
+abline(0,1)
+legend('bottomright', inset=.1,
+       legend=c("GLM", "glmnet", "RF", "GBM"),
+       col=c('black', 'blue', 'red', 'cyan'), lty=1, lwd=2)
+```
+네가지 모형 모두 auc 값이 높기때문에 ROC curve 또한 좌상단으로 치우쳐 있다.
+
+
+##### 2-3. example2: firmicutes & others with collapsed 5mer
+임의로 20,000개의 서열을 추출하고 firmicutes 속을 기준으로 나눈다.  
+pentamer nucleotide 서열 정보를 추가한다.
+```{r example2_data}
+
+# example2 : firmicutes & others with collasped 5 mer
+data <- phylum_seq %>% sample_n(20000)
+data %>%
+  summarize(n_firmicutes = n_distinct(data %>% filter(phylum == "firmicutes")),
+            n_others = n_distinct(data %>% filter(phylum != "firmicutes")))
+
+
+# counting nucleotide pentamer
+r16Sstr <- DNAStringSet(data$sequence)
+#k1fq = alphabetFrequency(r16Sstr)
+#k1fq = k1fq[,1:4]
+#k2fq = dinucleotideFrequency(r16Sstr)
+#k3fq = trinucleotideFrequency(r16Sstr)
+#k4fq = oligonucleotideFrequency(r16Sstr, width=4)
+k5fq = oligonucleotideFrequency(r16Sstr, width=5)
+
+#data <- cbind(data[,1], k1fq, k2fq, k3fq, k4fq, k5fq)
+data <- cbind(data[,1], k5fq)
+colnames(data)[1]<-'phylum'
+data$phylum <- factor(ifelse(data$phylum == 'firmicutes', 0, 1))
+head(data)[1:10]
+```
+
+우선 이 서열 정보를 모두 사용하여 분석을 진행한다.
+```{r}
+data2 <- data
+```
+
+#####example2 running
+```{r running2}
+#TRAINING
+set.seed(2306)
+n <- nrow(data2)
+idx <- 1:n
+training_idx <- sample(idx, n * .60)
+idx <- setdiff(idx, training_idx)
+validate_idx <- sample(idx, n * .20)
+test_idx <- setdiff(idx, validate_idx)
+training <- data2[training_idx,]
+validation <- data2[validate_idx,]
+test <- data2[test_idx,]
+
+
+#LOGISTIC REGRESSION
+tic("LOGISTIC")
+data2_lm_full <- glm(phylum ~ ., data=training, family=binomial)
+#summary.glm(data2_lm_full)
+LOGISTIC_time <- toc()
+cbind(as.data.frame(data2[1:5, 1]),
+      as.data.frame(predict(data2_lm_full, newdata = data2[1:5,], type='response')))
+
+
+contribution <- as.data.frame(data2_lm_full$coefficients)
+modified_contribution <- as.data.frame(cbind(nucleotide = rownames(contribution), score = contribution[, 1]))
+sorted_contribution <- modified_contribution[rev(order(modified_contribution[, 2])),]
+print(sorted_contribution[2:6, ])
+
+
+#MODEL EVALUATION
+y_obs <- as.numeric(as.character(validation$phylum))
+yhat_lm <- predict(data2_lm_full, newdata = validation, type='response')
+pred_lm <- prediction(as.numeric(yhat_lm), as.numeric(y_obs))
+#performance(pred_lm, "auc")@y.values[[1]]
+#binomial_deviance(y_obs, yhat_lm) 
+#plot(performance(pred_lm, measure="tpr", x.measure='fpr'))
+
+
+```
+
+LASSO 모델.
+```{r}
+
+
+#LASSO MODEL
+xx <- model.matrix(phylum ~ .-1, data2)
+x <- xx[training_idx, ]
+y <- as.numeric(as.character(training$phylum))
+#glimpse(x)
+
+
+tic("LASSO")
+data2_cvfit <- cv.glmnet(x, y, family = "binomial")
+
+plot(data2_cvfit)
+LASSO_time <- toc()
+
+#coef(data2_cvfit, s = c("lambda.1se"))
+length(which(coef(data2_cvfit, s ="lambda.min")>0)) #141
+
+#MODEL EVALUATION
+predi <- as.data.frame(predict.cv.glmnet(data2_cvfit, s='lambda.min', newx = x[1:5,], type='response'))
+cbind(data2[as.numeric(rownames(x[1:5,])), 1], predi)
+
+yhat_glmnet <- predict(data2_cvfit, s="lambda.min", newx=xx[validate_idx,],
+                       type='response')
+yhat_glmnet <- yhat_glmnet[,1]
+pred_glmnet <- prediction(yhat_glmnet, y_obs)
+#performance(pred_glmnet, "auc")@y.values[[1]]
+#binomial_deviance(y_obs, yhat_glmnet)
+```
+```  
+parameter 개수는 141개이면 층분하다.
+
+
+
+나무 모델  
+
+```{r}
+#TREE MODEL
+data2_tr <- rpart(phylum ~ ., data = training)
+#data2_tr
+
+#printcp(data2_tr)
+#summary(data2_tr)
+
+opar <- par(mfrow = c(1,1), xpd = NA)
+plot(data2_tr)
+text(data2_tr, use.n = T)
+par(opar)
+
+#EVALUATION
+yhat_tr <- predict(data2_tr, validation)
+yhat_tr <- yhat_tr[,"1"]
+pred_tr <- prediction(yhat_tr, y_obs)
+#performance(pred_tr, "auc")@y.values[[1]]
+#binomial_deviance(y_obs, yhat_tr)
+```
+
+랜덤 포레스트
+```{r}
+#RANDOM FOREST
+set.seed(2305)
+tic("RF")
+data2_rf <- randomForest(phylum ~., training)
+#data2_rf
+RF_time <- toc()
+#opar <- par(mfrow=c(1,2))
+#plot(data2_rf)
+#varImpPlot(data2_rf)
+#par(opar)
+
+#EVALUATION
+yhat_rf <- predict(data2_rf, newdata=validation, type='prob')[,'1']
+pred_rf <- prediction(yhat_rf, y_obs)
+#performance(pred_rf, "auc")@y.values[[1]]
+#binomial_deviance(y_obs, yhat_rf)
+```
+
+부스팅
+```{r}
+#BOOSTING
+set.seed(2305)
+tic("BOOSTING")
+data2_for_gbm <-
+  training %>%
+  mutate(phylum=as.numeric(as.character(phylum)))
+data2_gbm <- gbm(phylum ~ .,
+                           data = data2_for_gbm, distribution="bernoulli",
+                           n.trees=990,
+                           n.minobsinnode = 1,
+                           cv.folds=3,
+                           verbose=T)
+(best_iter = gbm.perf(data2_gbm, method="cv")) #990
+BOOSTING_time <- toc()
+
+#EVALUATION
+yhat_gbm <- predict(data2_gbm, n.trees=best_iter, newdata=validation, type='response')
+pred_gbm <- prediction(yhat_gbm, y_obs)
+#performance(pred_gbm, "auc")@y.values[[1]]
+#binomial_deviance(y_obs, yhat_gbm)
+```
+
+```{r}
+(ex2_final <- data.frame(method=c('lm', 'glmnet', 'rf', 'gbm'),
+           time = c(LOGISTIC_time$callback_msg,
+                    LASSO_time$callback_msg,
+                    RF_time$callback_msg,
+                    BOOSTING_time$callback_msg),
+           auc = c(performance(pred_lm, "auc")@y.values[[1]],
+                   performance(pred_glmnet, "auc")@y.values[[1]],
+                   performance(pred_rf, "auc")@y.values[[1]],
+                   performance(pred_gbm, "auc")@y.values[[1]]),
+           bin_dev = c(binomial_deviance(y_obs, yhat_lm),
+                       binomial_deviance(y_obs, yhat_glmnet),
+                       binomial_deviance(y_obs, yhat_rf),
+                       binomial_deviance(y_obs, yhat_gbm))))
+```
+
+
+
+
+
+##### 2-4. example3: firmicutes & others with collapsed 5mer
+임의로 20,000개의 서열을 추출하고 firmicutes 속을 기준으로 나눈다.  
+pentamer nucleotide 서열 정보를 추가한다.
+```{r example3_data}
+
+# example2 : firmicutes & others with collasped 5 mer
+data <- phylum_seq %>% sample_n(20000)
+data %>%
+  summarize(n_firmicutes = n_distinct(data %>% filter(phylum == "firmicutes")),
+            n_others = n_distinct(data %>% filter(phylum != "firmicutes")))
+
+
+# counting nucleotide pentamer
+r16Sstr <- DNAStringSet(data$sequence)
+#k1fq = alphabetFrequency(r16Sstr)
+#k1fq = k1fq[,1:4]
+#k2fq = dinucleotideFrequency(r16Sstr)
+#k3fq = trinucleotideFrequency(r16Sstr)
+#k4fq = oligonucleotideFrequency(r16Sstr, width=4)
+k5fq = oligonucleotideFrequency(r16Sstr, width=5)
+
+#data <- cbind(data[,1], k1fq, k2fq, k3fq, k4fq, k5fq)
+data <- cbind(data[,1], k5fq)
+colnames(data)[1]<-'phylum'
+data$phylum <- factor(ifelse(data$phylum == 'firmicutes', 0, 1))
+head(data)[1:10]
+```
+
+이 서열 정보중 높은 상관관계에 있는 서열은 제외한다.
+correlation 상수값 0.29는 변수가 150개 정도가 되도록 하는 값이다.
+```{r cor}
+#pairs.panels(data[,c(2:11)], 
+#             method = "pearson",
+#             hist.col = "#00AFBB",
+#             density = TRUE,
+#             ellipses = TRUE)
+library(tictoc)
+tic("correlation")
+cor_matrix <- cor(data[,c(2:1025)])
+cor_time <- toc()
+data.frame(time=cor_time$callback_msg)
+cor_matrix_rm <- cor_matrix
+cor_matrix_rm[upper.tri(cor_matrix_rm)] <- 0
+diag(cor_matrix_rm) <- 0
+
+data_new <- data[ , !apply(cor_matrix_rm,
+                           2,
+                           function(x) any(abs(x) > 0.29))] 
+
+#pairs.panels(data_new[,c(1:10)], 
+#             method = "pearson",
+#             hist.col = "#00AFBB",
+#             density = TRUE,
+#             ellipses = TRUE
+#)
+
+#data2 <- data
+data2 <- cbind(data[,1], data_new)
+colnames(data2)[1]<-'phylum'
+data.frame(data=dim(data)[2], data2=dim(data2)[2])
+```
+
+#####example3 running
+
+```{r running3}
+#TRAINING
+set.seed(2306)
+n <- nrow(data2)
+idx <- 1:n
+training_idx <- sample(idx, n * .60)
+idx <- setdiff(idx, training_idx)
+validate_idx <- sample(idx, n * .20)
+test_idx <- setdiff(idx, validate_idx)
+training <- data2[training_idx,]
+validation <- data2[validate_idx,]
+test <- data2[test_idx,]
+
+
+#LOGISTIC REGRESSION
+tic("LOGISTIC")
+data2_lm_full <- glm(phylum ~ ., data=training, family=binomial)
+summary.glm(data2_lm_full)
+LOGISTIC_time <- toc()
+cbind(as.data.frame(data2[1:5, 1]),
+      as.data.frame(predict(data2_lm_full, newdata = data2[1:5,], type='response')))
+
+
+contribution <- as.data.frame(data2_lm_full$coefficients)
+modified_contribution <- as.data.frame(cbind(nucleotide = rownames(contribution), score = contribution[, 1]))
+sorted_contribution <- modified_contribution[rev(order(modified_contribution[, 2])),]
+print(sorted_contribution[2:6, ])
+
+
+#MODEL EVALUATION
+y_obs <- as.numeric(as.character(validation$phylum))
+yhat_lm <- predict(data2_lm_full, newdata = validation, type='response')
+pred_lm <- prediction(as.numeric(yhat_lm), as.numeric(y_obs))
+#performance(pred_lm, "auc")@y.values[[1]]
+#binomial_deviance(y_obs, yhat_lm) 
+#plot(performance(pred_lm, measure="tpr", x.measure='fpr'))
+
+
+```
+
+LASSO 모델.
+parameter 수: 148 -> 65
+```{r}
+#LASSO MODEL
+xx <- model.matrix(phylum ~ .-1, data2)
+x <- xx[training_idx, ]
+y <- as.numeric(as.character(training$phylum))
+#glimpse(x)
+
+
+tic("LASSO")
+data2_cvfit <- cv.glmnet(x, y, family = "binomial")
+
+plot(data2_cvfit)
+LASSO_time <- toc()
+
+#coef(data2_cvfit, s = c("lambda.1se"))
+length(which(coef(data2_cvfit, s ="lambda.min")>0)) #65
+```
+  
+다섯개 서열에 대해서 예상
+```{r}
+#MODEL EVALUATION
+predi <- as.data.frame(predict.cv.glmnet(data2_cvfit, s='lambda.min', newx = x[1:5,], type='response'))
+cbind(data2[as.numeric(rownames(x[1:5,])), 1], predi)
+
+yhat_glmnet <- predict(data2_cvfit, s="lambda.min", newx=xx[validate_idx,],
+                       type='response')
+yhat_glmnet <- yhat_glmnet[,1]
+pred_glmnet <- prediction(yhat_glmnet, y_obs)
+#performance(pred_glmnet, "auc")@y.values[[1]]
+#binomial_deviance(y_obs, yhat_glmnet)
+```
+  
+나무 모델
+```{r}
+#TREE MODEL
+data2_tr <- rpart(phylum ~ ., data = training)
+#data2_tr
+
+#printcp(data2_tr)
+#summary(data2_tr)
+
+opar <- par(mfrow = c(1,1), xpd = NA)
+plot(data2_tr)
+text(data2_tr, use.n = T)
+par(opar)
+
+#EVALUATION
+yhat_tr <- predict(data2_tr, validation)
+yhat_tr <- yhat_tr[,"1"]
+pred_tr <- prediction(yhat_tr, y_obs)
+#performance(pred_tr, "auc")@y.values[[1]]
+#binomial_deviance(y_obs, yhat_tr)
+```
+
+랜덤 포레스트
+```{r}
+#RANDOM FOREST
+set.seed(2305)
+tic("RF")
+data2_rf <- randomForest(phylum ~., training)
+#data2_rf
+RF_time <- toc()
+#opar <- par(mfrow=c(1,2))
+#plot(data2_rf)
+#varImpPlot(data2_rf)
+#par(opar)
+
+#EVALUATION
+yhat_rf <- predict(data2_rf, newdata=validation, type='prob')[,'1']
+pred_rf <- prediction(yhat_rf, y_obs)
+#performance(pred_rf, "auc")@y.values[[1]]
+#binomial_deviance(y_obs, yhat_rf)
+```
+
+부스팅
+```{r}
+#BOOSTING
+set.seed(2305)
+tic("BOOSTING")
+data2_for_gbm <-
+  training %>%
+  mutate(phylum=as.numeric(as.character(phylum)))
+data2_gbm <- gbm(phylum ~ .,
+                           data = data2_for_gbm, distribution="bernoulli",
+                           n.trees=990,
+                           n.minobsinnode = 1,
+                           cv.folds=3,
+                           verbose=T)
+(best_iter = gbm.perf(data2_gbm, method="cv")) #990
+BOOSTING_time <- toc()
+
+#EVALUATION
+yhat_gbm <- predict(data2_gbm, n.trees=best_iter, newdata=validation, type='response')
+pred_gbm <- prediction(yhat_gbm, y_obs)
+#performance(pred_gbm, "auc")@y.values[[1]]
+#binomial_deviance(y_obs, yhat_gbm)
+```
+
+```{r}
+(ex3_final <- data.frame(method=c('lm', 'glmnet', 'rf', 'gbm'),
+           time = c(LOGISTIC_time$callback_msg,
+                    LASSO_time$callback_msg,
+                    RF_time$callback_msg,
+                    BOOSTING_time$callback_msg),
+           auc = c(performance(pred_lm, "auc")@y.values[[1]],
+                   performance(pred_glmnet, "auc")@y.values[[1]],
+                   performance(pred_rf, "auc")@y.values[[1]],
+                   performance(pred_gbm, "auc")@y.values[[1]]),
+           bin_dev = c(binomial_deviance(y_obs, yhat_lm),
+                       binomial_deviance(y_obs, yhat_glmnet),
+                       binomial_deviance(y_obs, yhat_rf),
+                       binomial_deviance(y_obs, yhat_gbm))))
+cbind(ex2_final, ex3_final)
+```
+
+
+auc 값이 비슷한 수준에서 랜덤 포레스트 분석 결과를 빠르게 얻을 수 있었다.  
+Correlation 계산의 소요시간이 9.4초 정도 인 것을 감안하여도 로지스틱 모형, 랜덤포레스트, 부스팅 모델에서 시간적 이점을 얻을 수 있었다.
+
+
+##### 3-1. multivariative by binomial data  
+LASSO 모형을 이용해서 특정 16S 서열의 phylum을 예상하기
+
+```{r example3 data}
+# number of phyla which have more than 100, 1000, 10000 freq
+phylum_table %>%
+  summarize(more_than_100 = n_distinct(phylum_table %>% filter(Freq > 100)),
+            more_than_1000 = n_distinct(phylum_table %>% filter(Freq > 1000)),
+            more_than_10000 = n_distinct(phylum_table %>% filter(Freq > 10000))
+  ) #120, 38, 5
+```
+
+phylum의 종류, 서열의 수를 고려하여 서열 수 1,000개를 기준으로 한다. (38가지 phylum)  
+데이터 내의 38가지의 phylum에 대해서 1,000개씩 서열을 추출한 후 해당 phylum 1000개, others 1000개가 연속되게 오도록 서열 pool을 만든다.
+```{r}
+#random 100 sequences of each phylum
+filtered_phylum_table <- phylum_table %>% filter(Freq >= 1000)
+#filtered_phylum_table2 <- phylum_table %>% filter(Freq <= 100, !is.na(phylum)) # 196 phylum
+sampled_phylum_seq <- data.frame(matrix(nrow=0, ncol=2))
+colnames(sampled_phylum_seq) <- c('phylum', 'sequence')
+for (i in 1:38){
+  sampled_phylum_seq <-
+    rbind(sampled_phylum_seq, phylum_seq %>%
+            filter(phylum == filtered_phylum_table$phylum[i]) %>%
+            sample_n(1000))
+}
+glimpse(sampled_phylum_seq)
+
+
+
+
+phylum_seq_pool <- data.frame(matrix(nrow=0, ncol=2))
+for (i in 1:38){
+  target <- sampled_phylum_seq %>%
+    filter(phylum == filtered_phylum_table$phylum[i])
+  learn <- sampled_phylum_seq %>%
+    filter(phylum != filtered_phylum_table$phylum[i]) %>%
+    sample_n(1000)
+  target_learn <- rbind(target, learn)
+  phylum_seq_pool <- rbind(phylum_seq_pool, target_learn)
+}
+dim(phylum_seq_pool)
+
+
+phylum_table %>% filter(Freq >= 1000)
+
+```
+
+
+
+
+##### 3-2 finding
+총 76000개의 서열 정보를 2000개 씩 나누어 training 한 후 phylum을 찾고 싶은 16s 서열에 대해서 predict한다. 이 과정을 38번 반복해서 predict 결과를 순서대로 정렬하여 가장 유사한 phyla를 순서대로 확인한다.
+```{r finding}
+#example <- phylum_seq %>% filter(phylum == "acidobacteriota") %>%
+#  sample_n(1)
+
+example <- readDNAStringSet("/Users/chungminkim/Downloads/sequence-2.fasta")
+# e.coli - proteobacteria
+
+example <- data.frame(id=names(example),sequences=as.character(example))
+colnames(example) <- c('phylum', 'sequence')
+
+result <- data.frame(matrix(nrow=0, ncol=2))
+tic("finding")
+for (i in 1:38){
+  data <- phylum_seq_pool[(2000*i-1999):(2000*i),]
+  #data <- phylum_seq_pool[1:200,]
+  data <- rbind(data, example)
+  
+  r16Sstr <- DNAStringSet(data$sequence)
+  k5fq = oligonucleotideFrequency(r16Sstr, width=5)
+  
+  data <- cbind(data[,1], k5fq)
+  colnames(data)[1]<-'phylum'
+  #as_tibble(data)
+  #data$phylum <- factor(ifelse(data$phylum == phylum_seq_pool[200*i-199,1], 0, 1))
+  data[1:1000,1] <- 0
+  data[1001:2001,1] <- 1
+  cor_matrix <- cor(data[,c(2:1025)])
+  cor_matrix_rm <- cor_matrix
+  cor_matrix_rm[upper.tri(cor_matrix_rm)] <- 0
+  diag(cor_matrix_rm) <- 0
+  
+  
+  #pairs.panels(data[,c(2:11)], 
+  #             method = "pearson",
+  #             hist.col = "#00AFBB",
+  #             density = TRUE,
+  #             ellipses = TRUE)
+  
+  data_new <- data[ , !apply(cor_matrix_rm,
+                             2,
+                             function(x) any(abs(x) > 0.30))] 
+  
+  #pairs.panels(data_new[,c(1:10)], 
+  #             method = "pearson",
+  #             hist.col = "#00AFBB",
+  #             density = TRUE,
+  #             ellipses = TRUE
+  #)
+  
+  
+  data2 <- cbind(data[,1], data_new)
+  colnames(data2)[1]<-'phylum'
+  
+  example2 <- data2[2001, ]
+  data2 <- data2[1:2000, ]
+  
+  
+  #TRAINING
+  set.seed(2306)
+  n <- nrow(data2)
+  idx <- 1:n
+  training_idx <- sample(idx, n * .60)
+  idx <- setdiff(idx, training_idx)
+  validate_idx <- sample(idx, n * .20)
+  test_idx <- setdiff(idx, validate_idx)
+  training <- data2[training_idx,]
+  validation <- data2[validate_idx,]
+  test <- data2[test_idx,]
+  
+  xx <- model.matrix(phylum ~ .-1, data2)
+  x <- xx[training_idx, ]
+  y <- as.numeric(as.character(training$phylum))
+  #glimpse(x)
+  
+  data2_cvfit <- cv.glmnet(x, y, family = "binomial")
+  #plot(data2_cvfit)
+  
+  #coef(data2_cvfit, s = c("lambda.1se"))
+  #coef(data2_cvfit, s = c("lambda.min"))
+  
+  #MODEL EVALUATION
+  
+  
+  #######
+  example2 <- example2[1, 2:(ncol(example2))]
+  pre <- as.data.frame(predict.cv.glmnet(data2_cvfit, s='lambda.min',
+                                         newx = as.double(example2), type='response'))
+  
+  result <- rbind(result, pre)
+  #######
+  
+  #yhat_glmnet <- predict(data2_cvfit, s="lambda.min", newx=xx[validate_idx,],
+  #                       type='response')
+  #yhat_glmnet <- yhat_glmnet[,1]
+  #pred_glmnet <- prediction(yhat_glmnet, y_obs)
+  #performance(pred_glmnet, "auc")@y.values[[1]]
+  #binomial_deviance(y_obs, yhat_glmnet)
+}
+finding_time <- toc()
+
+#data.frame(time=c(finding_time$callback_msg))
+
+result
+phylum_seq_pool[as.vector(which.min(result[,1])) * 2000 - 1999, 1]
+
+rank <- cbind(filtered_phylum_table$phylum, result)
+head(arrange(rank, by_group=lambda.min))
+```
