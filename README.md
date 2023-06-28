@@ -29,7 +29,9 @@
    
 |firmicutes|others|       | data |collapsed data|
 |-----|-----|-----|----|-----|
-|4569|15431|      |1024|147|
+|4569|15431|      |1024|147|  
+
+* For finding example, 1,000 seuqences of each phylum which has more than 1,000 sequences were randomly selected and other 1000 sequences were added for raining.
   
 ## 3. Used Model - All process were worked in R environment
 * Logistic regression
@@ -39,9 +41,19 @@
 * Boosting
   
 ## 4. Results
-* 
-   
+* Example1
+  * Summary
+    |method|time (s)|auc|bin_dev|
+    |-----|-----|-----|-----|
+    |LOGISTIC|0.846|0.9894948|806.6|
+    |LASSO|9.456|0.9899495|784.4|
+    |RF|24.025|0.9941032|1144.1|
+    |BOOSTING|27.32|0.9929736|680.5|
+      
+  * top5 significant sequqences
+    1. TA 2. AT 3. GG 4. TG 5. TT
+* Example2
+  * Summary
 
 
 
-* For finding example, 1,000 seuqences of each phylum which has more than 1,000 sequences were randomly selected and other 1000 sequences were added for raining.
