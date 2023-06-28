@@ -8,3 +8,4 @@
 |frequency more than| > 100 | > 1000 | > 10000 |
 |-----|----|-----|------|
 |number of phylum| 119 | 38 | 5 |
+
