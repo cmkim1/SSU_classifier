@@ -66,12 +66,35 @@
   * top5 significant sequences: 1. TGATA 2. ACCGA 3. GTTCT 4. TTACG 5. CTGGT
 
 * Example3: collapsed pentamer
+  Correlation coefficient threshold was determined by Example2 LASSO data.
+  Number of appropriate number of parameters were around 125.
+  The target number was 150.
+  ```
+  length(which(coef(data2_cvfit, s ="lambda.min")>0))
+  ```
+  ```
+  ## [1] 114
+  ```
   * Summary
-    |Model|time (s)|auc|bin_dev|
-    |-----|-----|-----|-----|
-    |LOGISTIC|219.47|0.9990533|238.8|
-    |LASSO|18.317|0.9997188|113.7|
-    |RF|373.869|0.9996336|576.5|
-    |BOOSTING|1079.283|0.9995689|139.3|
+    |Model|time (s)|auc|bin_dev|time (s)|auc|bin_dev|
+    |-----|-----|-----|-----|-----|-----|-----|
+    |used|-|All pentamer|-|-|Collapsed pentamer|-|
+    |LOGISTIC|219.47|0.9990533|238.8|2.017|0.9987319|297.7|
+    |LASSO|18.317|0.9997188|113.7|9.597|0.9989139|278.0|
+    |RF|373.869|0.9996336|576.5|36.716|0.9994395|737.9|
+    |BOOSTING|1079.283|0.9995689|139.3|23.708|0.9985275|321.9|
+
+  Time required were reduced especially in LOGISTIC, RF, BOOSTING model.
+  It has additional time for correlation step (9.264 sec), but plenty of time has been saved
+```
+tic("correlation")
+cor_matrix <- cor(data[,c(2:1025)])
+cor_time <- toc()
+```
+```
+## correlation: 9.264 sec elapsed
+```
+* Example4: finding phylum
+  
 
 
